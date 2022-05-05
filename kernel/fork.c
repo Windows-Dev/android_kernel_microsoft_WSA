@@ -978,10 +978,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #ifdef CONFIG_MEMCG
 	tsk->active_memcg = NULL;
 #endif
-
-	android_init_vendor_data(tsk, 1);
-	android_init_oem_data(tsk, 1);
-
+	memset(&tsk->android_vendor_data1, 0, sizeof(tsk->android_vendor_data1));
+	memset(&tsk->android_oem_data1, 0, sizeof(tsk->android_oem_data1));
 	trace_android_vh_dup_task_struct(tsk, orig);
 	return tsk;
 
@@ -1074,8 +1072,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm_init_owner(mm, p);
 	mm_init_pasid(mm);
 	RCU_INIT_POINTER(mm->exe_file, NULL);
-	if (!mmu_notifier_subscriptions_init(mm))
-		goto fail_nopgd;
+	mmu_notifier_subscriptions_init(mm);
 	init_tlb_flush_pending(mm);
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
 	mm->pmd_huge_pte = NULL;
