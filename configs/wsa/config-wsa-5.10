@@ -4935,3 +4935,8 @@ CONFIG_CC_HAS_SANCOV_TRACE_PC=y
 # CONFIG_HYPERV_TESTING is not set
 # end of Kernel Testing and Coverage
 # end of Kernel hacking
+
+#
+# Kernel-Assisted Superuser
+#
+CONFIG_ASSISTED_SUPERUSER=y
