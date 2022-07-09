@@ -37,6 +37,7 @@ struct dxgvmbuspacket {
 	void *buffer;
 	u32 buffer_length;
 	int status;
+	bool completed;
 };
 
 struct dxgvmb_ext_header {
@@ -230,19 +231,43 @@ void dxgvmbuschannel_destroy(struct dxgvmbuschannel *ch)
 	}
 }
 
-static inline void command_vm_to_host_init0(struct dxgkvmb_command_vm_to_host
-					    *command)
+/*
+ * Helper functions
+ */
+
+static void command_vm_to_host_init2(struct dxgkvmb_command_vm_to_host *command,
+				     enum dxgkvmb_commandtype_global t,
+				     struct d3dkmthandle process)
 {
-	command->command_type = DXGK_VMBCOMMAND_INVALID_VM_TO_HOST;
-	command->process.v = 0;
-	command->command_id = 0;
-	command->channel_type = DXGKVMB_VM_TO_HOST;
+	command->command_type	= t;
+	command->process	= process;
+	command->command_id	= 0;
+	command->channel_type	= DXGKVMB_VM_TO_HOST;
 }
 
-static inline void command_vm_to_host_init1(struct dxgkvmb_command_vm_to_host
-					    *command,
-					    enum dxgkvmb_commandtype_global
-					    type)
+static void command_vgpu_to_host_init1(struct dxgkvmb_command_vgpu_to_host
+					*command,
+					enum dxgkvmb_commandtype type)
+{
+	command->command_type	= type;
+	command->process.v	= 0;
+	command->command_id	= 0;
+	command->channel_type	= DXGKVMB_VGPU_TO_HOST;
+}
+
+static void command_vgpu_to_host_init2(struct dxgkvmb_command_vgpu_to_host
+					*command,
+					enum dxgkvmb_commandtype type,
+					struct d3dkmthandle process)
+{
+	command->command_type	= type;
+	command->process	= process;
+	command->command_id	= 0;
+	command->channel_type	= DXGKVMB_VGPU_TO_HOST;
+}
+
+static void command_vm_to_host_init1(struct dxgkvmb_command_vm_to_host *command,
+				     enum dxgkvmb_commandtype_global type)
 {
 	command->command_type = type;
 	command->process.v = 0;
@@ -330,6 +355,7 @@ void process_completion_packet(struct dxgvmbuschannel *channel,
 		if (desc->trans_id == entry->request_id) {
 			packet = entry;
 			list_del(&packet->packet_list_entry);
+			packet->completed = true;
 			break;
 		}
 	}
@@ -412,6 +438,7 @@ int dxgvmb_send_sync_msg(struct dxgvmbuschannel *channel,
 	packet->buffer = result;
 	packet->buffer_length = result_size;
 	packet->status = 0;
+	packet->completed = false;
 	spin_lock_irq(&channel->packet_list_mutex);
 	list_add_tail(&packet->packet_list_entry, &channel->packet_list_head);
 	spin_unlock_irq(&channel->packet_list_mutex);
@@ -428,7 +455,15 @@ int dxgvmb_send_sync_msg(struct dxgvmbuschannel *channel,
 	}
 
 	dev_dbg(dxgglobaldev, "waiting completion: %llu", packet->request_id);
-	wait_for_completion(&packet->wait);
+	ret = wait_for_completion_killable(&packet->wait);
+	if (ret) {
+		pr_err("wait_for_complition failed: %x", ret);
+		spin_lock_irq(&channel->packet_list_mutex);
+		if (!packet->completed)
+			list_del(&packet->packet_list_entry);
+		spin_unlock_irq(&channel->packet_list_mutex);
+		goto cleanup;
+	}
 	dev_dbg(dxgglobaldev, "completion done: %llu %x",
 		packet->request_id, packet->status);
 	ret = packet->status;
@@ -1047,6 +1082,32 @@ cleanup:
 	return ret;
 }
 
+int dxgvmb_send_flush_device(struct dxgdevice *device,
+			     enum dxgdevice_flushschedulerreason reason)
+{
+	int ret;
+	struct dxgkvmb_command_flushdevice *command;
+	struct dxgvmbusmsg msg = {.hdr = NULL};
+	struct dxgprocess *process = device->process;
+
+	ret = init_message(&msg, device->adapter, process, sizeof(*command));
+	if (ret)
+		goto cleanup;
+	command = (void *)msg.msg;
+
+	command_vgpu_to_host_init2(&command->hdr, DXGK_VMBCOMMAND_FLUSHDEVICE,
+				   process->host_handle);
+	command->device = device->handle;
+	command->reason = reason;
+
+	ret = dxgvmb_send_sync_msg_ntstatus(msg.channel, msg.hdr, msg.size);
+cleanup:
+	free_message(&msg, process);
+	if (ret)
+		dev_dbg(dxgglobaldev, "err: %s %d", __func__, ret);
+	return ret;
+}
+
 struct d3dkmthandle
 dxgvmb_send_create_context(struct dxgadapter *adapter,
 			   struct dxgprocess *process,
@@ -1248,7 +1309,7 @@ copy_private_data(struct d3dkmt_createallocation *args,
 
 	if (args->flags.standard_allocation) {
 		dev_dbg(dxgglobaldev, "private data offset %d",
-			     (u32) (private_data_dest - (u8 *) command));
+			(u32) (private_data_dest - (u8 *) command));
 
 		args->priv_drv_data_size = sizeof(*args->standard_allocation);
 		memcpy(private_data_dest, standard_alloc,
@@ -1281,7 +1342,7 @@ copy_private_data(struct d3dkmt_createallocation *args,
 					     input_alloc->priv_drv_data_size);
 			if (ret) {
 				pr_err("%s failed to copy alloc data",
-				        __func__);
+					__func__);
 				ret = -EINVAL;
 				goto cleanup;
 			}
@@ -1307,15 +1368,18 @@ int create_existing_sysmem(struct dxgdevice *device,
 	void *kmem = NULL;
 	int ret = 0;
 	struct dxgkvmb_command_setexistingsysmemstore *set_store_command;
+	struct dxgkvmb_command_setexistingsysmempages *set_pages_command;
 	u64 alloc_size = host_alloc->allocation_size;
 	u32 npages = alloc_size >> PAGE_SHIFT;
 	struct dxgvmbusmsg msg = {.hdr = NULL};
-
-	ret = init_message(&msg, device->adapter, device->process,
-			   sizeof(*set_store_command));
-	if (ret)
-		goto cleanup;
-	set_store_command = (void *)msg.msg;
+	const u32 max_pfns_in_message =
+		(DXG_MAX_VM_BUS_PACKET_SIZE - sizeof(*set_pages_command) -
+		PAGE_SIZE) / sizeof(__u64);
+	u32 alloc_offset_in_pages = 0;
+	struct page **page_in;
+	u64 *pfn;
+	u32 pages_to_send;
+	u32 i;
 
 	/*
 	 * Create a guest physical address list and set it as the allocation
@@ -1326,6 +1390,7 @@ int create_existing_sysmem(struct dxgdevice *device,
 	dev_dbg(dxgglobaldev, "   Alloc size: %lld", alloc_size);
 
 	dxgalloc->cpu_address = (void *)sysmem;
+
 	dxgalloc->pages = vzalloc(npages * sizeof(void *));
 	if (dxgalloc->pages == NULL) {
 		pr_err("failed to allocate pages");
@@ -1343,31 +1408,79 @@ int create_existing_sysmem(struct dxgdevice *device,
 		ret = -ENOMEM;
 		goto cleanup;
 	}
-	kmem = vmap(dxgalloc->pages, npages, VM_MAP, PAGE_KERNEL);
-	if (kmem == NULL) {
-		pr_err("vmap failed");
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-	ret1 = vmbus_establish_gpadl(dxgglobal_get_vmbus(), kmem,
-				     alloc_size, &dxgalloc->gpadl);
-	if (ret1) {
-		pr_err("establish_gpadl failed: %d", ret1);
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-	dev_dbg(dxgglobaldev, "New gpadl %d", dxgalloc->gpadl);
+	if (!dxgglobal->map_guest_pages_enabled) {
+		ret = init_message(&msg, device->adapter, device->process,
+				sizeof(*set_store_command));
+		if (ret)
+			goto cleanup;
+		set_store_command = (void *)msg.msg;
 
-	command_vgpu_to_host_init2(&set_store_command->hdr,
-				   DXGK_VMBCOMMAND_SETEXISTINGSYSMEMSTORE,
-				   device->process->host_handle);
-	set_store_command->device = device->handle;
-	set_store_command->device = device->handle;
-	set_store_command->allocation = host_alloc->allocation;
-	set_store_command->gpadl = dxgalloc->gpadl;
-	ret = dxgvmb_send_sync_msg_ntstatus(msg.channel, msg.hdr, msg.size);
-	if (ret < 0)
-		pr_err("failed to set existing store: %x", ret);
+		kmem = vmap(dxgalloc->pages, npages, VM_MAP, PAGE_KERNEL);
+		if (kmem == NULL) {
+			pr_err("vmap failed");
+			ret = -ENOMEM;
+			goto cleanup;
+		}
+		ret1 = vmbus_establish_gpadl(dxgglobal_get_vmbus(), kmem,
+					alloc_size, &dxgalloc->gpadl);
+		if (ret1) {
+			pr_err("establish_gpadl failed: %d", ret1);
+			ret = -ENOMEM;
+			goto cleanup;
+		}
+		dev_dbg(dxgglobaldev, "New gpadl %d", dxgalloc->gpadl);
+
+		command_vgpu_to_host_init2(&set_store_command->hdr,
+					DXGK_VMBCOMMAND_SETEXISTINGSYSMEMSTORE,
+					device->process->host_handle);
+		set_store_command->device = device->handle;
+		set_store_command->allocation = host_alloc->allocation;
+		set_store_command->gpadl = dxgalloc->gpadl;
+		ret = dxgvmb_send_sync_msg_ntstatus(msg.channel, msg.hdr,
+						    msg.size);
+		if (ret < 0)
+			pr_err("failed to set existing store: %x", ret);
+	} else {
+		/*
+		 * Send the list of the allocation PFNs to the host. The host
+		 * will map the pages for GPU access.
+		 */
+
+		ret = init_message(&msg, device->adapter, device->process,
+				sizeof(*set_pages_command) +
+				max_pfns_in_message * sizeof(u64));
+		if (ret)
+			goto cleanup;
+		set_pages_command = (void *)msg.msg;
+		command_vgpu_to_host_init2(&set_pages_command->hdr,
+					DXGK_VMBCOMMAND_SETEXISTINGSYSMEMPAGES,
+					device->process->host_handle);
+		set_pages_command->device = device->handle;
+		set_pages_command->allocation = host_alloc->allocation;
+
+		page_in = dxgalloc->pages;
+		while (alloc_offset_in_pages < npages) {
+			pfn = (u64 *)((char *)msg.msg +
+				sizeof(*set_pages_command));
+			pages_to_send = min(npages - alloc_offset_in_pages,
+					    max_pfns_in_message);
+			set_pages_command->num_pages = pages_to_send;
+			set_pages_command->alloc_offset_in_pages =
+				alloc_offset_in_pages;
+
+			for (i = 0; i < pages_to_send; i++)
+				*pfn++ = page_to_pfn(*page_in++);
+
+			ret = dxgvmb_send_sync_msg_ntstatus(msg.channel,
+							    msg.hdr,
+							    msg.size);
+			if (ret < 0) {
+				pr_err("failed to set existing pages: %x", ret);
+				break;
+			}
+			alloc_offset_in_pages += pages_to_send;
+		}
+	}
 
 cleanup:
 	if (kmem)

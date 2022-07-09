@@ -139,6 +139,8 @@ enum dxgkvmb_commandtype {
 	DXGK_VMBCOMMAND_GETCONTEXTSCHEDULINGPRIORITY = 61,
 	DXGK_VMBCOMMAND_QUERYCLOCKCALIBRATION	= 62,
 	DXGK_VMBCOMMAND_QUERYRESOURCEINFO	= 64,
+	DXGK_VMBCOMMAND_LOGEVENT		= 65,
+	DXGK_VMBCOMMAND_SETEXISTINGSYSMEMPAGES	= 66,
 	DXGK_VMBCOMMAND_INVALID
 };
 
@@ -243,6 +245,16 @@ struct dxgkvmb_command_setexistingsysmemstore {
 	struct d3dkmthandle		device;
 	struct d3dkmthandle		allocation;
 	u32				gpadl;
+};
+
+/* Returns ntstatus */
+struct dxgkvmb_command_setexistingsysmempages {
+	struct dxgkvmb_command_vgpu_to_host hdr;
+	struct d3dkmthandle		device;
+	struct d3dkmthandle		allocation;
+	u32				num_pages;
+	u32				alloc_offset_in_pages;
+	/* u64 pfn_array[num_pages] */
 };
 
 struct dxgkvmb_command_createprocess {
@@ -382,6 +394,13 @@ struct dxgkvmb_command_createdevice_return {
 struct dxgkvmb_command_destroydevice {
 	struct dxgkvmb_command_vgpu_to_host hdr;
 	struct d3dkmthandle		device;
+};
+
+struct dxgkvmb_command_flushdevice
+{
+	struct dxgkvmb_command_vgpu_to_host	hdr;
+	struct d3dkmthandle			device;
+	enum dxgdevice_flushschedulerreason	reason;
 };
 
 struct dxgkvmb_command_makeresident {
@@ -859,54 +878,8 @@ struct dxgkvmb_command_shareobjectwithhost {
 struct dxgkvmb_command_shareobjectwithhost_return {
 	struct ntstatus	status;
 	u32		alignment;
-	u64 		vail_nt_handle;
+	u64		vail_nt_handle;
 };
-
-/*
- * Helper functions
- */
-static inline void command_vm_to_host_init2(struct dxgkvmb_command_vm_to_host
-					    *command,
-					    enum dxgkvmb_commandtype_global t,
-					    struct d3dkmthandle process)
-{
-	command->command_type	= t;
-	command->process	= process;
-	command->command_id	= 0;
-	command->channel_type	= DXGKVMB_VM_TO_HOST;
-}
-
-static inline void command_vgpu_to_host_init0(struct dxgkvmb_command_vm_to_host
-					      *command)
-{
-	command->command_type	= DXGK_VMBCOMMAND_INVALID;
-	command->process.v	= 0;
-	command->command_id	= 0;
-	command->channel_type	= DXGKVMB_VGPU_TO_HOST;
-}
-
-static inline void command_vgpu_to_host_init1(struct
-					      dxgkvmb_command_vgpu_to_host
-					      *command,
-					      enum dxgkvmb_commandtype type)
-{
-	command->command_type	= type;
-	command->process.v	= 0;
-	command->command_id	= 0;
-	command->channel_type	= DXGKVMB_VGPU_TO_HOST;
-}
-
-static inline void command_vgpu_to_host_init2(struct
-					      dxgkvmb_command_vgpu_to_host
-					      *command,
-					      enum dxgkvmb_commandtype type,
-					      struct d3dkmthandle process)
-{
-	command->command_type	= type;
-	command->process	= process;
-	command->command_id	= 0;
-	command->channel_type	= DXGKVMB_VGPU_TO_HOST;
-}
 
 int
 dxgvmb_send_sync_msg(struct dxgvmbuschannel *channel,

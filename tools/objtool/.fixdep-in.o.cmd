@@ -1,1 +1,0 @@
-cmd_/yocto/latte/new/LSG-linux-rolling/tools/objtool/fixdep-in.o :=  ld.lld -r -o /yocto/latte/new/LSG-linux-rolling/tools/objtool/fixdep-in.o  /yocto/latte/new/LSG-linux-rolling/tools/objtool/fixdep.o
